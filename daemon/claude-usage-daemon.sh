@@ -1,10 +1,10 @@
 #!/bin/bash
 # Claude Usage Tracker Daemon (BLE)
 # Reads Claude Code OAuth token, polls usage via API, sends to ESP32 over BLE GATT.
-# Auto-connects and reconnects to the Claude Controller BLE device.
+# Auto-connects and reconnects to the Clawdmeter BLE device.
 # Dependencies: curl, awk, bluetoothctl
 
-DEVICE_NAME="Claude Controller"
+DEVICE_NAME="Clawdmeter"
 DEVICE_MAC="${DEVICE_MAC:-}"  # auto-discovered if empty
 SERVICE_UUID="4c41555a-4465-7669-6365-000000000001"
 RX_CHAR_UUID="4c41555a-4465-7669-6365-000000000002"
@@ -21,7 +21,18 @@ log() {
 }
 
 read_token() {
-    grep -o '"accessToken":"[^"]*"' "$HOME/.claude/.credentials.json" | cut -d'"' -f4
+    # macOS: token lives in Keychain (service "Claude Code-credentials").
+    # Linux: token lives in ~/.claude/.credentials.json.
+    if [ "$(uname)" = "Darwin" ]; then
+        local blob
+        blob=$(security find-generic-password -s "Claude Code-credentials" -a "$USER" -w 2>/dev/null)
+        if [ -n "$blob" ]; then
+            # Extract accessToken from nested JSON: {"claudeAiOauth":{"accessToken":"..."}}
+            echo "$blob" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); a=d.get('claudeAiOauth',d); print(a.get('accessToken',''))" 2>/dev/null
+            return
+        fi
+    fi
+    grep -o '"accessToken"[[:space:]]*:[[:space:]]*"[^"]*"' "$HOME/.claude/.credentials.json" | cut -d'"' -f4
 }
 
 # Convert MAC to D-Bus path: AA:BB:CC:DD:EE:FF -> dev_AA_BB_CC_DD_EE_FF
@@ -60,7 +71,7 @@ save_mac() {
     echo "$DEVICE_MAC" > "$SAVED_MAC_FILE"
 }
 
-# Scan for Claude Controller
+# Scan for Clawdmeter
 scan_for_device() {
     log "Scanning for '$DEVICE_NAME'..."
     # Start LE scan
