@@ -30,13 +30,3 @@ struct UsageData {
     bool dual;                       // true when both providers were received
     bool valid;                      // false until first successful parse
 };
-    bool ok;                 // data parse succeeded
-    bool valid;              // false until this provider has data
-};
-
-struct UsageData {
-    ProviderUsageData providers[USAGE_PROVIDER_COUNT];
-    UsageProvider primary_provider;  // legacy top-level fields map here
-    bool dual;                       // true when both providers were received
-    bool valid;                      // false until first successful parse
-};
