@@ -2,6 +2,7 @@
 #include "splash.h"
 #include <lvgl.h>
 #include <string.h>
+#include <time.h>
 #include "logo.h"
 #include "icons.h"
 #include "codex_icon.h"
@@ -168,6 +169,16 @@ static lv_obj_t* ble_container;
 static lv_obj_t* lbl_ble_status;
 static lv_obj_t* lbl_ble_device;
 static lv_obj_t* lbl_ble_mac;
+
+// Clock fed by the daemon: base epoch (local wall-clock seconds) + the lv_tick at
+// which it landed, so the title ticks forward locally between 60s payloads.
+static long     clock_base_epoch = 0;
+static uint32_t clock_base_ms = 0;
+static int      clock_fmt = 24;   // 12 or 24, set from the daemon payload
+static int      clock_last_min = -1;   // last rendered minute; avoids redrawing every tick
+// Title labels per usage screen (for clock tick update)
+static lv_obj_t* usage_titles[3];  // [0]=dual, [1]=claude, [2]=codex
+static int usage_title_count = 0;
 
 // ---- Battery indicator (shared, on top) ----
 static lv_obj_t* battery_img;
@@ -535,7 +546,9 @@ static void make_single_metric_panel(lv_obj_t* parent, int y, const char* label,
     lv_label_set_text(*out_reset, "--");
     lv_obj_set_style_text_font(*out_reset, L.scr_h >= 460 ? &font_styrene_28 : L.usage_name_font, 0);
     lv_obj_set_style_text_color(*out_reset, COL_DIM, 0);
-    lv_obj_set_pos(*out_reset, 0, reset_y);
+lv_obj_set_pos(*out_reset, 0, L.usage_reset_y);
+
+    return panel;
 }
 
 static lv_obj_t* make_usage_root(lv_obj_t* scr, const char* title) {
@@ -549,6 +562,9 @@ static lv_obj_t* make_usage_root(lv_obj_t* scr, const char* title) {
     lv_obj_add_event_cb(root, global_click_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t* lbl_title = lv_label_create(root);
+    if (usage_title_count < 3) {
+        usage_titles[usage_title_count++] = lbl_title;
+    }
     lv_label_set_text(lbl_title, title);
     lv_obj_set_style_text_font(lbl_title, L.usage_title_font, 0);
     lv_obj_set_style_text_color(lbl_title, COL_TEXT, 0);
@@ -669,7 +685,7 @@ static void init_usage_screen(lv_obj_t* scr) {
                               L.content_y + L.usage_panel_h + L.usage_panel_gap,
                               L.usage_panel_h, "Codex");
 
-    lbl_anim = lv_label_create(usage_dual_container);
+lbl_anim = lv_label_create(usage_dual_container);
     lv_label_set_text(lbl_anim, "");
     lv_obj_set_style_text_font(lbl_anim, &font_mono_32, 0);
     lv_obj_set_style_text_color(lbl_anim, COL_ACCENT, 0);
@@ -940,20 +956,54 @@ void ui_update(const UsageData* data) {
     data_received = true;
     update_view_state();
 
+// Sync clock from primary provider data
+    const ProviderUsageData* primary = &data->providers[data->primary_provider];
+    if (primary->clock_epoch > 0) {
+        clock_base_epoch = primary->clock_epoch;
+        clock_base_ms = last_data_ms;
+        clock_fmt = primary->clock_fmt;
+    } else if (clock_base_epoch != 0) {
+        clock_base_epoch = 0;
+        clock_last_min = -1;
+    }
+
     for (int i = 0; i < USAGE_PROVIDER_COUNT; i++) {
         update_provider_usage_widgets(&dual_widgets[i], &single_widgets[i],
                                       &data->providers[i]);
+    }
     }
 }
 
 void ui_tick_anim(void) {
     uint32_t now = lv_tick_get();
 
-    // Hide toast after duration (works on all screens)
+// Hide toast after duration (works on all screens)
     if (toast_label && toast_shown_ms > 0 &&
         (now - toast_shown_ms) >= TOAST_DURATION_MS) {
         lv_obj_add_flag(toast_label, LV_OBJ_FLAG_HIDDEN);
         toast_shown_ms = 0;
+    }
+
+    // Title clock: tick every minute between payloads
+    if (clock_base_epoch > 0) {
+        time_t cur = (time_t)(clock_base_epoch + (now - clock_base_ms) / 1000);
+        struct tm tmv;
+        gmtime_r(&cur, &tmv);
+        if (tmv.tm_min != clock_last_min) {
+            clock_last_min = tmv.tm_min;
+            char tbuf[12];
+            if (clock_fmt == 12) {
+                int h12 = tmv.tm_hour % 12;
+                if (h12 == 0) h12 = 12;
+                snprintf(tbuf, sizeof(tbuf), "%d:%02d %s", h12, tmv.tm_min,
+                         tmv.tm_hour < 12 ? "AM" : "PM");
+            } else {
+                snprintf(tbuf, sizeof(tbuf), "%02d:%02d", tmv.tm_hour, tmv.tm_min);
+            }
+            for (int i = 0; i < usage_title_count; i++) {
+                lv_label_set_text(usage_titles[i], tbuf);
+            }
+        }
     }
 
     if (current_screen != SCREEN_USAGE &&

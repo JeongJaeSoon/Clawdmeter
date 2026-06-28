@@ -19,6 +19,7 @@
 #include "hal/input_hal.h"
 #include "hal/power_hal.h"
 #include "hal/imu_hal.h"
+#include "hal/sound_hal.h"
 
 static UsageData usage = {};
 
@@ -128,6 +129,14 @@ static bool parse_provider_usage(JsonVariantConst src, ProviderUsageData* out) {
     out->weekly_pct = src["w"] | 0.0f;
     out->weekly_reset_mins = src["wr"] | -1;
     strlcpy(out->status, src["st"] | "unknown", sizeof(out->status));
+    out->chime = src["c"] | false;   // absent (old daemon / chime off) → stay silent
+    const char* acct = src["acct"] | "pro";
+    out->enterprise = (strcmp(acct, "ent") == 0);
+    out->time_pct = src["tp"] | 0;
+    out->period_days = src["pd"] | 30;
+    strlcpy(out->reset_date, src["rd"] | "", sizeof(out->reset_date));
+    out->clock_epoch = src["t"] | 0L;
+    out->clock_fmt = src["tf"] | 24;
     out->ok = src["ok"] | false;
     out->valid = true;
     return true;
@@ -151,7 +160,7 @@ static bool parse_json(const char* json, UsageData* out) {
         return false;
     }
 
-    reset_usage(out);
+reset_usage(out);
 
     const char* provider_name = doc["p"] | "claude";
     const bool has_claude = !doc["c"].isNull();
@@ -247,6 +256,8 @@ static void check_serial_cmd() {
         if (c == '\n' || c == '\r') {
             cmd_buf[cmd_pos] = '\0';
             if (cmd_pos > 0) handle_serial_cmd(cmd_buf);
+            else if (strcmp(cmd_buf, "screenshot") == 0) send_screenshot();
+            else if (strcmp(cmd_buf, "buzz") == 0)  sound_hal_play_reset();
             cmd_pos = 0;
         } else if (cmd_pos < CMD_BUF_SIZE - 1) {
             cmd_buf[cmd_pos++] = c;
@@ -274,6 +285,7 @@ void setup() {
 
     power_hal_init();
     imu_hal_init();
+    sound_hal_init();
     touch_hal_init();
 
     // ---- LVGL ----
@@ -364,6 +376,7 @@ void loop() {
     ble_tick();
     power_hal_tick();
     imu_hal_tick();
+    sound_hal_tick();
     splash_tick();
     // Rotation transition (blank + ramp) would fight the idle fade — skip
     // ticks while the panel is dark. A rotation that happens during sleep
@@ -458,8 +471,15 @@ void loop() {
         if (parse_json(ble_get_data(), &usage)) {
             const ProviderUsageData* sample = primary_usage(&usage);
             int g_before = usage_rate_group();
-            usage_rate_sample(sample->session_pct);
+bool session_reset = usage_rate_sample(sample->session_pct);
             int g_after = usage_rate_group();
+            // 5-hour session limit refilled → chime so the user knows they can
+            // use Claude again (no-op on boards without a buzzer). Gated on the
+            // daemon's opt-in `chime` config; the `buzz` serial cmd ignores it.
+            if (session_reset && sample->chime) {
+                Serial.println("session reset detected — chime");
+                sound_hal_play_reset();
+            }
             if (g_after != g_before) {
                 Serial.printf("usage rate: group %d -> %d (s=%.2f%%)\n",
                     g_before, g_after, sample->session_pct);
