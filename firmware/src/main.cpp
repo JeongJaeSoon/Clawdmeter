@@ -19,7 +19,6 @@
 #include "hal/input_hal.h"
 #include "hal/power_hal.h"
 #include "hal/imu_hal.h"
-#include "hal/sound_hal.h"
 
 static UsageData usage = {};
 
@@ -142,28 +141,6 @@ static const ProviderUsageData* primary_usage(const UsageData* data) {
     return &data->providers[USAGE_PROVIDER_CLAUDE];
 }
 
-static bool session_reset_detected(const UsageData* data) {
-    static bool seen[USAGE_PROVIDER_COUNT] = { false, false };
-    static float last_pct[USAGE_PROVIDER_COUNT] = { 0.0f, 0.0f };
-    static const char* names[USAGE_PROVIDER_COUNT] = { "Claude", "Codex" };
-    bool reset = false;
-
-    for (int i = 0; i < USAGE_PROVIDER_COUNT; i++) {
-        const ProviderUsageData* provider = &data->providers[i];
-        if (!provider->valid || !provider->ok) continue;
-
-        if (seen[i] && provider->session_pct + 5.0f < last_pct[i]) {
-            Serial.printf("%s session reset detected: %.2f%% -> %.2f%%\n",
-                          names[i], last_pct[i], provider->session_pct);
-            reset = true;
-        }
-        last_pct[i] = provider->session_pct;
-        seen[i] = true;
-    }
-
-    return reset;
-}
-
 // Parse a JSON line into UsageData. Supports the legacy single-provider
 // payload and the extended dual payload with "c" (Claude) and "x" (Codex).
 static bool parse_json(const char* json, UsageData* out) {
@@ -257,14 +234,10 @@ static void handle_serial_cmd(const char* cmd) {
         Serial.println("SCREEN_OK codex");
     } else if (strcmp(cmd, "splash") == 0 || strcmp(cmd, "screen splash") == 0) {
         ui_show_screen(SCREEN_SPLASH);
-        sound_hal_play_reset();
         Serial.println("SCREEN_OK splash");
     } else if (strcmp(cmd, "bluetooth") == 0 || strcmp(cmd, "screen bluetooth") == 0) {
         ui_show_screen(SCREEN_BLUETOOTH);
         Serial.println("SCREEN_OK bluetooth");
-    } else if (strcmp(cmd, "buzz") == 0) {
-        sound_hal_play_reset();
-        Serial.println("BUZZ_OK");
     }
 }
 
@@ -301,7 +274,6 @@ void setup() {
 
     power_hal_init();
     imu_hal_init();
-    sound_hal_init();
     touch_hal_init();
 
     // ---- LVGL ----
@@ -332,7 +304,6 @@ void setup() {
     ui_update_ble_status(ble_get_state(), ble_get_device_name(), ble_get_mac_address());
     ui_update_battery(power_hal_battery_pct(), power_hal_is_charging());
     ui_show_screen(SCREEN_SPLASH);
-    sound_hal_play_reset();
 
     Serial.printf("Dashboard ready (%s, %dx%d), waiting for data on BLE...\n",
         board_caps().name, W, H);
@@ -393,7 +364,6 @@ void loop() {
     ble_tick();
     power_hal_tick();
     imu_hal_tick();
-    sound_hal_tick();
     splash_tick();
     // Rotation transition (blank + ramp) would fight the idle fade — skip
     // ticks while the panel is dark. A rotation that happens during sleep
@@ -487,7 +457,6 @@ void loop() {
     if (ble_has_data()) {
         if (parse_json(ble_get_data(), &usage)) {
             const ProviderUsageData* sample = primary_usage(&usage);
-            bool reset_detected = session_reset_detected(&usage);
             int g_before = usage_rate_group();
             usage_rate_sample(sample->session_pct);
             int g_after = usage_rate_group();
@@ -496,7 +465,6 @@ void loop() {
                     g_before, g_after, sample->session_pct);
                 if (splash_is_active()) splash_pick_for_current_rate();
             }
-            if (reset_detected) sound_hal_play_reset();
             ui_update(&usage);
             ble_send_ack();
         } else {
