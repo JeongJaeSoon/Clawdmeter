@@ -546,9 +546,10 @@ static void make_single_metric_panel(lv_obj_t* parent, int y, const char* label,
     lv_label_set_text(*out_reset, "--");
     lv_obj_set_style_text_font(*out_reset, L.scr_h >= 460 ? &font_styrene_28 : L.usage_name_font, 0);
     lv_obj_set_style_text_color(*out_reset, COL_DIM, 0);
-lv_obj_set_pos(*out_reset, 0, L.usage_reset_y);
+    lv_obj_set_width(*out_reset, inner_w);
+    lv_label_set_long_mode(*out_reset, LV_LABEL_LONG_DOT);
+    lv_obj_set_pos(*out_reset, 0, reset_y);
 
-    return panel;
 }
 
 static lv_obj_t* make_usage_root(lv_obj_t* scr, const char* title) {
@@ -970,7 +971,6 @@ void ui_update(const UsageData* data) {
     for (int i = 0; i < USAGE_PROVIDER_COUNT; i++) {
         update_provider_usage_widgets(&dual_widgets[i], &single_widgets[i],
                                       &data->providers[i]);
-    }
     }
 }
 

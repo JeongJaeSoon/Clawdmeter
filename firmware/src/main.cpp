@@ -163,8 +163,8 @@ static bool parse_json(const char* json, UsageData* out) {
 reset_usage(out);
 
     const char* provider_name = doc["p"] | "claude";
-    const bool has_claude = !doc["c"].isNull();
-    const bool has_codex = !doc["x"].isNull();
+    const bool has_claude = doc["c"].is<JsonObjectConst>();
+    const bool has_codex = doc["x"].is<JsonObjectConst>();
     out->dual = has_claude || has_codex || strcmp(provider_name, "both") == 0;
 
     if (out->dual) {
