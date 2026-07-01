@@ -157,6 +157,38 @@ async def fetch_usage_payload(providers: list) -> dict | None:
     return payload
 
 
+def _extract_access_token(blob: str) -> str | None:
+    """Pull the accessToken out of a credentials blob.
+
+    Claude Code stores credentials as a JSON object; the blob may also be
+    nested ({"claudeAiOauth": {"accessToken": "..."}}). Fall back to a
+    regex match so unexpected shapes still work, and finally treat the
+    blob as a raw token if nothing else matches.
+    """
+    blob = blob.strip()
+    if not blob:
+        return None
+    try:
+        data = json.loads(blob)
+    except json.JSONDecodeError:
+        data = None
+    if isinstance(data, dict):
+        # direct: {"accessToken": "..."}
+        if isinstance(data.get("accessToken"), str):
+            return data["accessToken"]
+        # nested: {"claudeAiOauth": {"accessToken": "..."}}
+        for v in data.values():
+            if isinstance(v, dict) and isinstance(v.get("accessToken"), str):
+                return v["accessToken"]
+    m = re.search(r'"accessToken"\s*:\s*"([^"]+)"', blob)
+    if m:
+        return m.group(1)
+    # Raw token (no JSON wrapper) — must look plausible (sk-ant-... etc.)
+    if re.fullmatch(r"[A-Za-z0-9_\-.~+/=]{20,}", blob):
+        return blob
+    return None
+
+
 def _read_token_keychain() -> str | None:
     try:
         out = subprocess.run(
