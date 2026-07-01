@@ -587,9 +587,9 @@ async def connect_and_run(target, stop_event: asyncio.Event, providers: list) ->
             elapsed = now - last_poll
             if session.refresh_requested.is_set() or elapsed >= POLL_INTERVAL:
                 session.refresh_requested.clear()
-                payload = await poll_active_payload()
+                payload = await fetch_usage_payload(providers)
                 if payload is None:
-                    log("No usable config dir this cycle")
+                    log("No usable payload this cycle")
                 elif await session.write_payload(payload):
                     last_poll = time.time()
                     used_successfully = True
