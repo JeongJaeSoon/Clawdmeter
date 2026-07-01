@@ -23,6 +23,12 @@ The device boots into the splash. Tap the screen anywhere to switch to the Usage
 
 While the splash is up, the middle (PWR) button cycles animations. **Hold the power button for 3 seconds, then release, to put the device into pairing mode** — this clears the saved Bluetooth bond and re-advertises. The firmware also auto-rotates animations every 20 s within the current usage-rate group, so a long stretch on the splash isn't just one Clawd on loop.
 
+## Agent worktree manager
+
+Using this space to advertise another one of my projects. It's in the prototyping stages and is my take on an agent worktree manager similar to Claude Squad with integrations for GitHub and Azure DevOps. Written to meet my needs at work which is maintaining a monorepo and often having multiple worktrees open simultaneously as well as often needing to review code while I am working on other things.
+
+[Kirby - AI Agent worktree and pull request manager](https://github.com/hermannbjorgvin/kirby)
+
 ## Hardware
 
 Boards supported out of the box:
@@ -262,31 +268,6 @@ lv_font_conv --font assets/DejaVuSansMono.ttf \
 4. Add `.fallback = NULL`, `.user_data = NULL` to the font struct
 
 Without these patches, fonts compile but render as invisible.
-
-### CJK support
-
-`firmware/src/font_cjk_16.c` covers the full CJK Unified Ideographs basic
-block (U+4E00–U+9FFF, ~20k glyphs) plus ASCII, CJK punctuation, and
-halfwidth/fullwidth forms. Generated from [Noto Sans CJK SC](https://github.com/notofonts/noto-cjk)
-(SIL OFL 1.1) at 16px, 2bpp:
-
-```bash
-lv_font_conv --font NotoSansCJKsc-Regular.otf --size 16 --bpp 2 \
-  --no-compress --format lvgl --lv-include 'lvgl.h' \
-  -r '0x20-0x7E,0xB7,0x2014,0x2018-0x2019,0x201C-0x201D,0x2026,0x3000-0x303F,0x4E00-0x9FFF,0xFF00-0xFFEF' \
-  -o firmware/src/font_cjk_16.c
-```
-
-Then apply the four LVGL 9 patches above. Because the font has >65k of
-glyph bitmap data, the build needs `-DLV_FONT_FMT_TXT_LARGE=1` in
-`platformio.ini` build flags so font descriptor offsets switch from
-16-bit to 32-bit.
-
-The CJK font is used for the Activity screen's user-prompt row and todo
-content rows. The headline (28pt Styrene B) and titles stay ASCII-only
-to preserve the brand font — Chinese text in those slots renders as
-empty boxes. Add a `font_cjk_28.c` if full coverage is needed (~1MB
-more flash).
 
 ## Converting Lucide icons
 

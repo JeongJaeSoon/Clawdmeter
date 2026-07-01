@@ -34,6 +34,10 @@ TICK = 5
 SCAN_TIMEOUT = 8.0
 CONNECT_TIMEOUT = 20.0
 
+# macOS: token lives in Keychain (service "Claude Code-credentials").
+# Linux: token lives in ~/.claude/.credentials.json.
+KEYCHAIN_SERVICE = "Claude Code-credentials"
+DEFAULT_CONFIG_DIR = Path.home() / ".claude"
 SAVED_ADDR_FILE = Path.home() / ".config" / "claude-usage-monitor" / "ble-address"
 CONFIG_PATH = Path(__file__).with_name("config.toml")
 VALID_PROVIDERS = {"claude", "codex", "both"}
@@ -150,6 +154,51 @@ async def fetch_usage_payload(providers: list) -> dict | None:
             by_name.get(name, failed_usage(f"{name}_missing"))
         )
     return payload
+
+
+def read_config_dirs() -> list[Path]:
+    """Claude config dirs to poll, from the `config_dirs` option (comma list).
+
+    Defaults to [~/.claude] so existing single-plan setups are unchanged. ~ is
+    expanded. Mirrors the Linux bash daemon's read_config_dirs.
+    """
+    raw = ""
+    try:
+        if CONFIG_PATH.exists():
+            for line in CONFIG_PATH.read_text().splitlines():
+                line = line.split("#", 1)[0].strip()
+                if "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                if key.strip().lower() == "config_dirs":
+                    raw = val.strip()
+    except OSError:
+        pass
+    if not raw:
+        return [DEFAULT_CONFIG_DIR]
+    dirs = [Path(p.strip()).expanduser() for p in raw.split(",") if p.strip()]
+    return dirs or [DEFAULT_CONFIG_DIR]
+
+
+def read_token_for(config_dir: Path) -> str | None:
+    """Read the OAuth token for one config dir.
+
+    Linux: each dir keeps its own ``<dir>/.credentials.json``. macOS: the default
+    install stores the token in Keychain with no file, so for the default dir we
+    fall back to Keychain when no file is present — preserving existing
+    single-plan macOS behavior. Additional macOS dirs are read from their files;
+    a work plan whose token lives only in the single Keychain entry can't be told
+    apart there (documented follow-up).
+    """
+    cred = config_dir / ".credentials.json"
+    try:
+        if cred.exists():
+            return _extract_access_token(cred.read_text())
+    except OSError as e:
+        log(f"Error reading credentials in {config_dir}: {e}")
+    if sys.platform == "darwin" and config_dir == DEFAULT_CONFIG_DIR:
+        return _read_token_keychain()
+    return None
 
 
 # ---- Address cache ---------------------------------------------------------
@@ -277,6 +326,61 @@ async def discover_target(skip_addr: str | None = None):
 
 
 # ---- Session ---------------------------------------------------------------
+
+class PlanSelector:
+    """Decide which config dir's plan is "active" across polls.
+
+    "Active" = the plan whose session % rose most recently (recent API activity).
+    A rise stamps a monotonic poll counter, so the choice is sticky and a window
+    reset (a drop to 0) isn't mistaken for use. Before any rise is seen (startup)
+    the highest current session % wins. Mirrors the Linux bash daemon.
+    """
+
+    def __init__(self) -> None:
+        self.prev_s: dict[Path, int] = {}
+        self.last_active: dict[Path, int] = {}
+        self.seq = 0
+
+    def choose(self, sessions: dict[Path, int]) -> Path:
+        """Update state from this cycle's {dir: session_pct} and return the active dir."""
+        self.seq += 1
+        for d, s in sessions.items():
+            if d in self.prev_s and s > self.prev_s[d]:
+                self.last_active[d] = self.seq
+            self.prev_s[d] = s
+        # Most recent activity wins; ties (and the startup case) break by highest %.
+        return max(sessions, key=lambda d: (self.last_active.get(d, 0), sessions[d]))
+
+
+# Module-level so the active-plan state survives reconnects.
+_SELECTOR = PlanSelector()
+
+
+async def poll_active_payload(selector: PlanSelector = _SELECTOR) -> dict | None:
+    """Poll every configured config dir and return the active plan's payload.
+
+    Returns None when no dir yields a usable payload this cycle. A single
+    configured dir (the default) collapses to exactly the old single-poll path.
+    """
+    dirs = read_config_dirs()
+    payloads: dict[Path, dict] = {}
+    sessions: dict[Path, int] = {}
+    for d in dirs:
+        token = read_token_for(d)
+        if not token:
+            log(f"No token in {d}; skipping")
+            continue
+        payload = await poll_api(token)
+        if payload is not None:
+            payloads[d] = payload
+            sessions[d] = int(payload.get("s", 0) or 0)
+    if not payloads:
+        return None
+    active = selector.choose(sessions)
+    if len(dirs) > 1:
+        log(f"Active plan: {active} (s={sessions[active]})")
+    return payloads[active]
+
 
 class Session:
     def __init__(self, client: BleakClient) -> None:
@@ -411,11 +515,12 @@ async def connect_and_run(target, stop_event: asyncio.Event, providers: list) ->
             elapsed = now - last_poll
             if session.refresh_requested.is_set() or elapsed >= POLL_INTERVAL:
                 session.refresh_requested.clear()
-                payload = await fetch_usage_payload(providers)
-                if payload is not None:
-                    if await session.write_payload(payload):
-                        last_poll = time.time()
-                        used_successfully = True
+                payload = await poll_active_payload()
+                if payload is None:
+                    log("No usable config dir this cycle")
+                elif await session.write_payload(payload):
+                    last_poll = time.time()
+                    used_successfully = True
 
             try:
                 await asyncio.wait_for(session.refresh_requested.wait(), timeout=TICK)

@@ -21,8 +21,46 @@ log() {
     echo "[$(date '+%H:%M:%S')] $1"
 }
 
-read_token() {
-    grep -o '"accessToken":"[^"]*"' "$HOME/.claude/.credentials.json" | cut -d'"' -f4
+# --- Multi config-dir support ---------------------------------------------
+# Claude Code can run against more than one config dir (e.g. ~/.claude for a
+# personal plan and ~/.claude-work for a work plan, selected via
+# CLAUDE_CONFIG_DIR). The daemon polls each configured dir's token every cycle
+# and shows whichever plan is "active" (the one whose usage moved most recently
+# — see poll()). Per-dir state persists across poll() calls for that decision.
+declare -A PREV_S       # last session % seen per dir (detects a rise = activity)
+declare -A LAST_ACTIVE  # poll-sequence number of the last observed rise (0 = never)
+POLL_SEQ=0              # monotonic poll counter — recency ordering that's immune to
+                        # wall-clock resolution and NTP steps (polls are 60s apart, but
+                        # a counter is unambiguous even if two land in the same second)
+
+# Read the `config_dirs` option: a comma-separated list of Claude config dirs.
+# Defaults to "~/.claude" so existing single-plan setups are unchanged. Tildes
+# and $HOME are expanded; blanks trimmed. Echoes one resolved dir per line.
+read_config_dirs() {
+    local raw=""
+    if [ -f "$CONFIG_FILE" ]; then
+        raw=$(grep -E '^[[:space:]]*config_dirs[[:space:]]*=' "$CONFIG_FILE" | tail -1 \
+            | tr -d '\r' \
+            | sed -E 's/^[[:space:]]*config_dirs[[:space:]]*=[[:space:]]*//; s/[[:space:]]*(#.*)?$//')
+    fi
+    [ -z "$raw" ] && raw="$HOME/.claude"
+    local IFS=','
+    local d
+    for d in $raw; do
+        d=$(echo "$d" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+        [ -z "$d" ] && continue
+        case "$d" in
+            "~")   d="$HOME" ;;
+            "~/"*) d="$HOME/${d#\~/}" ;;
+        esac
+        echo "$d"
+    done
+}
+
+# Read the OAuth access token from a specific config dir's credentials file.
+read_token_for() {
+    local dir="$1"
+    grep -o '"accessToken":"[^"]*"' "$dir/.credentials.json" 2>/dev/null | cut -d'"' -f4
 }
 
 # Read the `chime` option from the config file. Echoes one of: off|on.
@@ -234,9 +272,12 @@ write_gatt() {
         WriteValue "aya{sv}" "$count" $bytes 0 2>/dev/null
 }
 
-poll() {
-    local token
-    token=$(read_token) || { log "Error: could not read token"; return 1; }
+# Build the device payload for one OAuth token. Echoes the JSON payload on
+# success (empty + non-zero return on failure). Pure: no logging, no GATT write
+# — poll() owns picking the active plan and sending it.
+build_payload_for_token() {
+    local token="$1"
+    [ -z "$token" ] && return 1
     local now
     now=$(date +%s)
 
@@ -267,7 +308,7 @@ poll() {
         -H "Content-Type: application/json" \
         -H "User-Agent: claude-code/2.1.5" \
         -d '{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}' \
-        2>/dev/null) || { log "Error: API call failed"; return 1; }
+        2>/dev/null) || return 1
 
     local s5h_util overage_util overage_reset status
     s5h_util=$(echo "$headers" | grep -i "anthropic-ratelimit-unified-5h-utilization" | tr -d '\r' | awk '{print $2}')
@@ -334,8 +375,67 @@ PYEOF
             }')
     fi
 
-    log "Sending: $payload"
-    write_gatt "$RX_CHAR_PATH" "$payload" || { log "Write failed"; return 1; }
+    printf '%s' "$payload"
+    return 0
+}
+
+# Extract the integer session % ("s") from a built payload, or 0.
+_payload_session_pct() {
+    echo "$1" | grep -o '"s":[0-9]*' | head -1 | cut -d: -f2
+}
+
+# Poll every configured config dir, decide which plan is "active", and send
+# that plan's payload. "Active" = the plan whose session % rose most recently
+# (recent API activity); a rise stamps LAST_ACTIVE so the choice is sticky and
+# survives window resets (a drop to 0 isn't activity). Before any rise is seen
+# (startup), fall back to the plan with the highest current session %.
+poll() {
+    POLL_SEQ=$((POLL_SEQ + 1))
+
+    local -a dirs
+    mapfile -t dirs < <(read_config_dirs)
+
+    local -A cycle_payload cycle_s
+    local dir token payload s
+    for dir in "${dirs[@]}"; do
+        token=$(read_token_for "$dir")
+        if [ -z "$token" ]; then
+            log "No token in $dir; skipping"
+            continue
+        fi
+        payload=$(build_payload_for_token "$token") || { log "API call failed for $dir"; continue; }
+        [ -z "$payload" ] && continue
+        s=$(_payload_session_pct "$payload"); s=${s:-0}
+        cycle_payload["$dir"]="$payload"
+        cycle_s["$dir"]="$s"
+        # A rise in session % since the previous poll means this plan was just used.
+        if [ -n "${PREV_S[$dir]:-}" ] && (( s > PREV_S[$dir] )); then
+            LAST_ACTIVE["$dir"]=$POLL_SEQ
+        fi
+        PREV_S["$dir"]="$s"
+    done
+
+    if [ ${#cycle_payload[@]} -eq 0 ]; then
+        log "No usable config dir this cycle"
+        return 1
+    fi
+
+    # Pick the active dir: most recent activity wins; ties (and the no-activity
+    # startup case) broken by highest current session %.
+    local best_dir="" best_active=-1 best_s=-1 a
+    for dir in "${!cycle_payload[@]}"; do
+        a=${LAST_ACTIVE[$dir]:-0}
+        s=${cycle_s[$dir]}
+        if (( a > best_active )) || (( a == best_active && s > best_s )); then
+            best_active=$a; best_s=$s; best_dir=$dir
+        fi
+    done
+
+    if [ ${#dirs[@]} -gt 1 ]; then
+        log "Active plan: $best_dir (s=$best_s)"
+    fi
+    log "Sending: ${cycle_payload[$best_dir]}"
+    write_gatt "$RX_CHAR_PATH" "${cycle_payload[$best_dir]}" || { log "Write failed"; return 1; }
     return 0
 }
 
