@@ -415,6 +415,19 @@ class PlanSelector:
 _SELECTOR = PlanSelector()
 
 
+async def poll_api(token: str) -> dict | None:
+    """Poll the Anthropic API with a single access token and return a payload."""
+    provider = ClaudeProvider(log)
+    from providers import Credentials, Usage
+    creds = Credentials(access_token=token)
+    usage = await provider._poll_api(creds)
+    if usage is None:
+        return None
+    payload = usage_to_payload(usage)
+    payload["p"] = "claude"
+    return payload
+
+
 async def poll_active_payload(selector: PlanSelector = _SELECTOR) -> dict | None:
     """Poll every configured config dir and return the active plan's payload.
 
