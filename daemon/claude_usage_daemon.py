@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import json
 import os
+import getpass
 import re
 import signal
 import subprocess
@@ -154,6 +155,32 @@ async def fetch_usage_payload(providers: list) -> dict | None:
             by_name.get(name, failed_usage(f"{name}_missing"))
         )
     return payload
+
+
+def _read_token_keychain() -> str | None:
+    try:
+        out = subprocess.run(
+            [
+                "security",
+                "find-generic-password",
+                "-s",
+                KEYCHAIN_SERVICE,
+                "-a",
+                getpass.getuser(),
+                "-w",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except subprocess.CalledProcessError as e:
+        log(f"Keychain read failed (rc={e.returncode}): {e.stderr.strip()}")
+        return None
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        log(f"Keychain access error: {e}")
+        return None
+    return _extract_access_token(out.stdout)
 
 
 def read_config_dirs() -> list[Path]:
