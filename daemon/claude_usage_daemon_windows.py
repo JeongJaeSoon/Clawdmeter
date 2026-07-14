@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 
 import httpx
-from bleak import BleakClient, BleakScanner
+from bleak import BleakClient
 from bleak.backends.device import BLEDevice
 from bleak.exc import BleakError
 
@@ -33,7 +33,6 @@ REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
 
 POLL_INTERVAL = 60
 TICK = 5
-SCAN_TIMEOUT = 8.0
 CONNECT_RETRIES = 3        # D-01: attempts before giving up on a device
 CONNECT_RETRY_DELAY = 2.0  # D-01: seconds between failed connect attempts
 ZOMBIE_BREAK_LIMIT = 1     # D-03: consecutive write failures before abandoning a half-open link
@@ -261,12 +260,28 @@ def _billing_period_info(now: float, reset_ts: str) -> dict:
         period_end = float(reset_ts)
     except ValueError:
         return {"tp": 0, "pd": 30, "rd": ""}
-    dt_end = datetime.datetime.fromtimestamp(period_end)
-    prev_month = dt_end.month - 1 or 12
-    prev_year = dt_end.year if dt_end.month > 1 else dt_end.year - 1
-    prev_day = min(dt_end.day, calendar.monthrange(prev_year, prev_month)[1])
-    dt_start = dt_end.replace(year=prev_year, month=prev_month, day=prev_day)
-    period_start = dt_start.timestamp()
+    if period_end <= 0:
+        # reset_ts defaults to "0" whenever the overage-reset header is absent
+        # (e.g. a 200 that simply carries no billing headers). fromtimestamp(0)
+        # is 1970; stepping one month back lands in 1969, and datetime.timestamp()
+        # raises OSError for pre-1970 dates on Windows — taking the whole poll
+        # loop down. Bail out to the neutral default instead.
+        return {"tp": 0, "pd": 30, "rd": ""}
+    try:
+        dt_end = datetime.datetime.fromtimestamp(period_end)
+        prev_month = dt_end.month - 1 or 12
+        prev_year = dt_end.year if dt_end.month > 1 else dt_end.year - 1
+        prev_day = min(dt_end.day, calendar.monthrange(prev_year, prev_month)[1])
+        dt_start = dt_end.replace(year=prev_year, month=prev_month, day=prev_day)
+        period_start = dt_start.timestamp()
+    except (OSError, OverflowError, ValueError):
+        # Belt-and-braces beyond the <= 0 guard above (#104): Windows
+        # datetime.timestamp()/fromtimestamp() also raise OSError(22)/
+        # OverflowError/ValueError for out-of-range NON-zero values (e.g. a
+        # far-future "99999999999999" header, which overflows fromtimestamp).
+        # Garbage must never crash the daemon thread — degrade to the safe
+        # default instead (field report: OSError(22) killed the poll loop).
+        return {"tp": 0, "pd": 30, "rd": ""}
     period_len = period_end - period_start
     if period_len <= 0:
         return {"tp": 0, "pd": 30, "rd": ""}
@@ -276,15 +291,6 @@ def _billing_period_info(now: float, reset_ts: str) -> dict:
         "pd": int(round(period_len / 86400)),
         "rd": f"{dt_end.strftime('%b')} {dt_end.day}",
     }
-
-
-async def scan_for_device():
-    """Scan for DEVICE_NAME and return the BLEDevice, or None."""
-    log(f"Scanning for '{DEVICE_NAME}' ({SCAN_TIMEOUT}s)...")
-    device = await BleakScanner.find_device_by_name(DEVICE_NAME, timeout=SCAN_TIMEOUT)
-    if device:
-        log(f"Found: {device.address}")
-    return device  # BLEDevice or None — NOT an address string
 
 
 def _mac_from_pnp_instance_id(instance_id: str) -> str | None:
@@ -316,7 +322,7 @@ def discover_bonded_address() -> str | None:
     1. CLAWDMETER_BLE_ADDRESS env override (skips discovery — testing / pinning).
     2. Windows PnP table, filtered to the device's FriendlyName.
 
-    Non-Windows or any failure returns None so the caller falls back to scanning.
+    Non-Windows or any failure returns None.
     """
     if override := os.environ.get("CLAWDMETER_BLE_ADDRESS"):
         return override.strip().upper()
@@ -347,14 +353,11 @@ def discover_bonded_address() -> str | None:
 async def acquire_target():
     """Return a connectable handle for the Clawdmeter, or None.
 
-    Tries an advertisement scan first (works on a fresh boot before the device
-    is bonded-and-connected), then falls back to the bonded address (the steady
-    state, where the device is connected to Windows and no longer advertising).
-    Returns a BLEDevice, an address string, or None.
+    Targets only the device bonded to THIS machine (via the PnP table /
+    CLAWDMETER_BLE_ADDRESS) — it never scans for a nearby device by name, so it
+    can't grab a stranger's or the wrong nearby unit. The device must be paired
+    with Windows once first (the documented setup). Returns a BLEDevice or None.
     """
-    device = await scan_for_device()
-    if device:
-        return device
     address = discover_bonded_address()
     if not address:
         return None
@@ -546,8 +549,15 @@ async def connect_and_run(device, stop_event: asyncio.Event, tray_state=None) ->
         )
         try:
             await client.connect()
-        except (BleakError, asyncio.TimeoutError) as e:
-            log(f"Connection attempt {attempt + 1}/{CONNECT_RETRIES} failed: {e}")
+        except (BleakError, OSError, asyncio.TimeoutError, AssertionError) as e:
+            # WinRT service discovery inside connect() can surface a raw OSError
+            # (WinError) or even a bare AssertionError from bleak's FutureLike
+            # (assert self._result) when the peer drops the link mid-discovery —
+            # neither is wrapped as BleakError. Treat them as a normal failed
+            # attempt so the D-01 retry loop handles them, instead of letting an
+            # uncaught exception kill the daemon thread (the "daemon crashed"
+            # tray toast + silent polling stop, field report).
+            log(f"Connection attempt {attempt + 1}/{CONNECT_RETRIES} failed: {type(e).__name__}: {e}")
             try:
                 await client.disconnect()
             except BleakError:
@@ -631,7 +641,10 @@ async def connect_and_run(device, stop_event: asyncio.Event, tray_state=None) ->
         # so swallow both; the link tears down regardless once we exit.
         try:
             await client.disconnect()
-        except (BleakError, OSError):
+        except (BleakError, OSError, AssertionError):
+            # bleak's WinRT disconnect() also has bare asserts (e.g. assert char
+            # while tearing down notifications on an already-gone peer); swallow
+            # it too — the link tears down regardless once we exit.
             pass
 
     log("Device disconnected" if not stop_event.is_set() else "Stopping")

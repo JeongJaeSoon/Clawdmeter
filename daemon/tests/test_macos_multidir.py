@@ -144,3 +144,35 @@ def test_poll_active_payload_selects_higher_util_plan(monkeypatch):
     with patch.object(mod, "poll_api", new=AsyncMock(side_effect=fake_poll)):
         payload = _run(mod.poll_active_payload(PlanSelector()))
     assert payload["s"] == 40  # startup -> highest util plan (B)
+
+
+# ---------------------------------------------------------------------------
+# discover_target — the daemon only ever targets the device this system already
+# holds; it never scans for a nearby device by name (there is no scan fallback).
+# ---------------------------------------------------------------------------
+
+def test_discover_target_darwin_uses_os_held_device(monkeypatch):
+    monkeypatch.setattr(mod.sys, "platform", "darwin")
+    sentinel = object()
+    with patch.object(mod, "retrieve_connected_macos", new=AsyncMock(return_value=sentinel)):
+        assert _run(mod.discover_target()) is sentinel  # used directly, no scan
+
+
+def test_discover_target_darwin_returns_none_when_not_held(monkeypatch):
+    # Not held by the OS -> wait (return None); never grabs an arbitrary device.
+    monkeypatch.setattr(mod.sys, "platform", "darwin")
+    with patch.object(mod, "retrieve_connected_macos", new=AsyncMock(return_value=None)):
+        assert _run(mod.discover_target()) is None
+
+
+def test_discover_target_non_darwin_uses_pinned_address(monkeypatch):
+    monkeypatch.setattr(mod.sys, "platform", "linux")
+    monkeypatch.setattr(mod, "load_cached_address", lambda: "AA:BB:CC:DD:EE:FF")
+    assert _run(mod.discover_target()) == "AA:BB:CC:DD:EE:FF"
+
+
+def test_discover_target_non_darwin_returns_none_without_pin(monkeypatch):
+    # No pinned address cached -> wait; never scans by name.
+    monkeypatch.setattr(mod.sys, "platform", "linux")
+    monkeypatch.setattr(mod, "load_cached_address", lambda: None)
+    assert _run(mod.discover_target()) is None

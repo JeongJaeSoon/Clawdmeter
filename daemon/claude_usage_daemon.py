@@ -18,6 +18,7 @@ import sys
 import time
 from pathlib import Path
 
+import httpx
 from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError
 
@@ -32,7 +33,6 @@ REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
 
 POLL_INTERVAL = 60
 TICK = 5
-SCAN_TIMEOUT = 8.0
 CONNECT_TIMEOUT = 20.0
 
 # macOS: token lives in Keychain (service "Claude Code-credentials").
@@ -281,8 +281,19 @@ def save_address(addr: str) -> None:
     SAVED_ADDR_FILE.write_text(addr)
 
 
-# ---- macOS CoreBluetooth recovery ------------------------------------------
-
+# --- macOS: recover a device the OS already holds as an HID keyboard --------
+#
+# The firmware advertises as a BLE HID keyboard so its buttons type into the
+# Mac. macOS auto-connects to that HID, and CoreBluetooth then EXCLUDES the
+# peripheral from BleakScanner.discover() results (already-connected devices
+# never appear in scans). bleak's connect-by-address path also scans
+# internally, so a cached address can't help either. The documented escape
+# hatch is retrieveConnectedPeripheralsWithServices_, which returns
+# peripherals the system is already connected to. We wrap the result in a
+# BLEDevice carrying the live (peripheral, manager) details so BleakClient
+# connects to it directly without scanning. CoreBluetooth shares the single
+# physical link, so this rides the existing HID connection - the keyboard
+# keeps working.
 _cb_manager = None  # reused CentralManagerDelegate (CoreBluetooth)
 
 
@@ -345,18 +356,20 @@ async def retrieve_connected_macos(skip_addr: str | None = None):
 async def discover_target(skip_addr: str | None = None):
     """Return a connectable target, or None.
 
-    macOS: prefer the system-connected peripheral (HID-grabbed devices are
-    invisible to scans); fall back to a normal scan that yields a BLEDevice
-    so the subsequent connect doesn't have to re-scan. ``skip_addr`` is
-    forwarded so a just-failed peripheral is skipped, making the scan
-    fallback reachable.
-
-    Linux: use cached address or scan by name.
+    The daemon only ever targets the device this system already holds — it
+    never scans for a nearby device by name, so it can't grab a stranger's or
+    the wrong nearby unit. On macOS that's the system-connected peripheral (the
+    firmware advertises as an HID keyboard, so once paired the OS auto-connects
+    and holds it — HID-grabbed devices are invisible to scans anyway). On other
+    platforms it's a previously-pinned address in the cache file. If the device
+    isn't held/pinned, we log and wait rather than scanning. ``skip_addr`` skips
+    a peripheral whose handle just failed to connect.
     """
     if sys.platform == "darwin":
         dev = await retrieve_connected_macos(skip_addr=skip_addr)
         if dev is not None:
             return dev
+        # Fallback: scan if system connection isn't available
         log(f"Not held by OS; scanning for '{DEVICE_NAME}' ({SCAN_TIMEOUT}s)...")
         devices = await BleakScanner.discover(timeout=SCAN_TIMEOUT)
         for d in devices:
@@ -382,6 +395,168 @@ async def discover_target(skip_addr: str | None = None):
             log(f"Found via scan: {d.address}")
             return d.address
     return None
+
+
+def read_chime_setting() -> str:
+    """Read the `chime` option from the config file. One of: off|on.
+
+    Defaults to "off" (the device stays silent) so existing setups are
+    unaffected until the user opts in.
+    """
+    try:
+        if CONFIG_FILE.exists():
+            for line in CONFIG_FILE.read_text().splitlines():
+                line = line.split("#", 1)[0].strip()
+                if "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                if key.strip().lower() == "chime":
+                    val = val.strip().lower()
+                    if val in ("off", "on"):
+                        return val
+    except OSError:
+        pass
+    return "off"
+
+
+def read_clock_setting() -> str:
+    """Read the `clock` option from the config file. One of: off|auto|12|24.
+
+    Defaults to "off" (no clock; the device keeps showing "Usage") so existing
+    setups are unaffected until the user opts in.
+    """
+    try:
+        if CONFIG_FILE.exists():
+            for line in CONFIG_FILE.read_text().splitlines():
+                line = line.split("#", 1)[0].strip()
+                if "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                if key.strip().lower() == "clock":
+                    val = val.strip().lower()
+                    if val in ("off", "auto", "12", "24"):
+                        return val
+    except OSError:
+        pass
+    return "off"
+
+
+def add_chime_field(payload: dict) -> None:
+    """Add "c":1 to the payload when the config opts in, so the firmware may
+    sound the session-reset chime. Omitted entirely when chime is off."""
+    if read_chime_setting() == "on":
+        payload["c"] = 1
+
+
+def detect_hour_format() -> int:
+    """Best-effort 12h/24h detection for the host. Returns 12 or 24 (default 24)."""
+    # macOS: the explicit System Settings toggle lives in NSGlobalDomain.
+    for key, result in (("AppleICUForce24HourTime", 24), ("AppleICUForce12HourTime", 12)):
+        try:
+            out = subprocess.run(["defaults", "read", "-g", key],
+                                 capture_output=True, text=True, timeout=3)
+            if out.stdout.strip() == "1":
+                return result
+        except (OSError, subprocess.SubprocessError):
+            pass
+    # Fallback to the C locale's time format (may be C/24h under launchd).
+    try:
+        import locale
+        locale.setlocale(locale.LC_TIME, "")
+        fmt = locale.nl_langinfo(locale.T_FMT)
+        if "%p" in fmt or "%r" in fmt or "%I" in fmt:
+            return 12
+    except (ImportError, locale.Error, AttributeError):
+        pass
+    return 24
+
+
+def add_clock_fields(payload: dict) -> None:
+    """Add wall-clock fields to the payload when the config opts in.
+
+    "t"  = local wall-clock epoch (UTC epoch shifted by the tz offset) so the
+           device can show the time without an RTC.
+    "tf" = 12 or 24, the hour format the device should render.
+    """
+    clock = read_clock_setting()
+    if clock == "off":
+        return
+    tf = 24 if clock == "24" else 12 if clock == "12" else detect_hour_format()
+    payload["t"] = int(time.time()) + time.localtime().tm_gmtoff
+    payload["tf"] = tf
+
+
+async def poll_api(token: str) -> dict | None:
+    headers = dict(API_HEADERS_TEMPLATE)
+    headers["Authorization"] = f"Bearer {token}"
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as http:
+            resp = await http.post(API_URL, headers=headers, json=API_BODY)
+    except httpx.HTTPError as e:
+        log(f"API call failed: {e}")
+        return None
+    if resp.status_code >= 400:
+        log(f"API HTTP {resp.status_code}: {resp.text[:200]}")
+        return None
+
+    # Linux: try cached address first, then scan.
+    addr = load_cached_address()
+    if addr:
+        devices = await BleakScanner.discover(timeout=SCAN_TIMEOUT)
+        for d in devices:
+            if d.address == addr and d.name == DEVICE_NAME:
+                log(f"Found cached device: {d.address}")
+                return d.address
+
+    # Scan for device by name.
+    devices = await BleakScanner.discover(timeout=SCAN_TIMEOUT)
+    for d in devices:
+        if d.name == DEVICE_NAME:
+            save_address(d.address)
+            log(f"Found via scan: {d.address}")
+            return d.address
+    return None
+
+
+def _billing_period_info(now: float, reset_ts: str) -> dict:
+    """Fraction of billing period elapsed (tp, 0-100) and period length in days (pd).
+
+    Billing periods are assumed calendar-monthly: period_end is the reset
+    timestamp, period_start is the same day/time one calendar month earlier.
+
+    The rate-limit headers expose only the reset timestamp, not the period
+    length, so the monthly window is an assumption — but a documented one:
+    Enterprise spend-limit `period` "the only value today is monthly"
+    (Claude Enterprise Admin API reference). The doc notes period is an open
+    string that may gain other values later; revisit this if so.
+    """
+    try:
+        period_end = float(reset_ts)
+    except ValueError:
+        return {"tp": 0, "pd": 30}
+    if period_end <= 0:
+        # reset_ts defaults to "0" when the overage-reset header is absent.
+        # fromtimestamp(0) is 1970; stepping a month back lands in 1969, and
+        # datetime.timestamp() raises OSError for pre-1970 dates on Windows.
+        # Benign on macOS/Linux, but guard here too to keep the daemons parallel.
+        return {"tp": 0, "pd": 30}
+    dt_end = datetime.datetime.fromtimestamp(period_end)
+    prev_month = dt_end.month - 1 or 12
+    prev_year = dt_end.year if dt_end.month > 1 else dt_end.year - 1
+    prev_day = min(dt_end.day, calendar.monthrange(prev_year, prev_month)[1])
+    dt_start = dt_end.replace(year=prev_year, month=prev_month, day=prev_day)
+    period_start = dt_start.timestamp()
+    period_len = period_end - period_start
+    if period_len <= 0:
+        return {"tp": 0, "pd": 30}
+    pct_val = (now - period_start) / period_len * 100
+    total_days = int(round(period_len / 86400))
+    rd = f"{dt_end.strftime('%b')} {dt_end.day}"
+    return {
+        "tp": max(0, min(100, int(round(pct_val)))),
+        "pd": total_days,
+        "rd": rd,
+    }
 
 
 # ---- Session ---------------------------------------------------------------

@@ -459,7 +459,7 @@ def test_main_connect_fail_uses_reconnect_backoff():
     call_count = [0]
     MAX_CALLS = 3
 
-    async def fake_scan():
+    async def fake_acquire():
         return fake_device  # always finds device
 
     async def fake_connect_and_run(device, event, tray_state=None):
@@ -473,7 +473,7 @@ def test_main_connect_fail_uses_reconnect_backoff():
         raise asyncio.TimeoutError()
 
     with patch("daemon.claude_usage_daemon_windows.asyncio.Event", side_effect=capturing_Event), \
-         patch("daemon.claude_usage_daemon_windows.scan_for_device", side_effect=fake_scan), \
+         patch("daemon.claude_usage_daemon_windows.acquire_target", side_effect=fake_acquire), \
          patch("daemon.claude_usage_daemon_windows.connect_and_run", side_effect=fake_connect_and_run), \
          patch("daemon.claude_usage_daemon_windows.asyncio.wait_for", side_effect=fake_wait_for):
         _run(mod.main())
@@ -507,7 +507,7 @@ def test_main_reconnect_backoff_reset_on_success():
     connect_results = [False, True, False]
     connect_idx = [0]
 
-    async def fake_scan():
+    async def fake_acquire():
         return fake_device
 
     async def fake_connect_and_run(device, event, tray_state=None):
@@ -525,7 +525,7 @@ def test_main_reconnect_backoff_reset_on_success():
         raise asyncio.TimeoutError()
 
     with patch("daemon.claude_usage_daemon_windows.asyncio.Event", side_effect=capturing_Event), \
-         patch("daemon.claude_usage_daemon_windows.scan_for_device", side_effect=fake_scan), \
+         patch("daemon.claude_usage_daemon_windows.acquire_target", side_effect=fake_acquire), \
          patch("daemon.claude_usage_daemon_windows.connect_and_run", side_effect=fake_connect_and_run), \
          patch("daemon.claude_usage_daemon_windows.asyncio.wait_for", side_effect=fake_wait_for):
         _run(mod.main())

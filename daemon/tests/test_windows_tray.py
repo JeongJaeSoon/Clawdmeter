@@ -124,8 +124,7 @@ def test_main_populates_tray_state_loop_and_stop_event():
         ts.stop_event.set()
         return None   # nothing acquired
 
-    # Patch acquire_target (main()'s device-acquisition seam), not scan_for_device:
-    # a None from scan_for_device alone would let acquire_target fall through to the
+    # Patch acquire_target (main()'s device-acquisition seam) so the test never does
     # real bonded-address discovery + a real BLE connect, hammering live hardware.
     with patch.object(mod, "acquire_target", side_effect=_fake_acquire):
         asyncio.run(mod.main(tray_state=ts))
@@ -318,9 +317,9 @@ def test_main_runs_in_background_thread_without_signal_error():
 
     def _run() -> None:
         try:
-            # Patch acquire_target, not scan_for_device — otherwise a None scan falls
-            # through to real bonded-address discovery + a real BLE connect (which would
-            # block past the 10s join below and make this regression test hit hardware).
+            # Patch acquire_target (the device-acquisition seam) so this never does
+            # real bonded-address discovery + a real BLE connect (which would block
+            # past the 10s join below and make this regression test hit hardware).
             with patch.object(mod, "acquire_target", side_effect=_fake_acquire):
                 asyncio.run(mod.main(tray_state=ts))
         except Exception as exc:   # noqa: BLE001 — capture for the assertion
