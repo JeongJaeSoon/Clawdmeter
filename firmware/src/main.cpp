@@ -11,6 +11,7 @@
 #include "usage_rate.h"
 #include "idle.h"
 #include "idle_cfg.h"
+#include "brightness.h"
 
 #include "hal/board_caps.h"
 #include "hal/display_hal.h"
@@ -18,6 +19,7 @@
 #include "hal/input_hal.h"
 #include "hal/power_hal.h"
 #include "hal/imu_hal.h"
+#include "hal/sound_hal.h"
 
 static UsageData usage = {};
 
@@ -127,6 +129,14 @@ static bool parse_provider_usage(JsonVariantConst src, ProviderUsageData* out) {
     out->weekly_pct = src["w"] | 0.0f;
     out->weekly_reset_mins = src["wr"] | -1;
     strlcpy(out->status, src["st"] | "unknown", sizeof(out->status));
+    out->chime = src["c"] | false;   // absent (old daemon / chime off) → stay silent
+    const char* acct = src["acct"] | "pro";
+    out->enterprise = (strcmp(acct, "ent") == 0);
+    out->time_pct = src["tp"] | 0;
+    out->period_days = src["pd"] | 30;
+    strlcpy(out->reset_date, src["rd"] | "", sizeof(out->reset_date));
+    out->clock_epoch = src["t"] | 0L;
+    out->clock_fmt = src["tf"] | 24;
     out->ok = src["ok"] | false;
     out->valid = true;
     return true;
@@ -150,11 +160,11 @@ static bool parse_json(const char* json, UsageData* out) {
         return false;
     }
 
-    reset_usage(out);
+reset_usage(out);
 
     const char* provider_name = doc["p"] | "claude";
-    const bool has_claude = !doc["c"].isNull();
-    const bool has_codex = !doc["x"].isNull();
+    const bool has_claude = doc["c"].is<JsonObjectConst>();
+    const bool has_codex = doc["x"].is<JsonObjectConst>();
     out->dual = has_claude || has_codex || strcmp(provider_name, "both") == 0;
 
     if (out->dual) {
@@ -246,6 +256,8 @@ static void check_serial_cmd() {
         if (c == '\n' || c == '\r') {
             cmd_buf[cmd_pos] = '\0';
             if (cmd_pos > 0) handle_serial_cmd(cmd_buf);
+            else if (strcmp(cmd_buf, "screenshot") == 0) send_screenshot();
+            else if (strcmp(cmd_buf, "buzz") == 0)  sound_hal_play_reset();
             cmd_pos = 0;
         } else if (cmd_pos < CMD_BUF_SIZE - 1) {
             cmd_buf[cmd_pos++] = c;
@@ -268,10 +280,12 @@ void setup() {
 
     display_hal_init();
     display_hal_begin();
-    idle_init();   // takes over brightness (DISPLAY_DEFAULT_BRIGHTNESS) and starts the idle timer
+    idle_init();        // takes over panel brightness and starts the idle timer
+    brightness_init();  // load the user's saved brightness level and apply via idle
 
     power_hal_init();
     imu_hal_init();
+    sound_hal_init();
     touch_hal_init();
 
     // ---- LVGL ----
@@ -309,6 +323,52 @@ void setup() {
 
 static ble_state_t last_ble_state = BLE_STATE_INIT;
 
+// Hold-to-pair gesture: hold the PWR button ~3s, then RELEASE → clear all BLE
+// bonds and re-advertise. Clearing on *release* (not while held) is deliberate:
+// holding to power the device OFF (AXP hardware shutdown at 8s) must not wipe
+// the bond — a power-off hold never releases before shutdown. To stop a
+// "chicken-out" release just before 8s from pairing, the gesture disarms at 6s.
+//
+//   ~1.5s long-press edge → PENDING
+//   3.0s (+1500)          → ARMED   (release from here clears bonds)
+//   6.0s (+4500)          → DISARMED (no clear; AXP powers off at 8s)
+#define PAIR_ARM_AFTER_LONG_MS    1500   // 3.0s total
+#define PAIR_DISARM_AFTER_LONG_MS 4500   // 6.0s total
+enum pair_state_t { PAIR_IDLE, PAIR_PENDING, PAIR_ARMED };
+static pair_state_t pair_state        = PAIR_IDLE;
+static uint32_t     pair_long_seen_ms = 0;
+
+static void pair_tick(void) {
+    if (pair_state == PAIR_IDLE && power_hal_pwr_long_pressed()) {
+        pair_state = PAIR_PENDING;
+        pair_long_seen_ms = millis();
+        (void)power_hal_pwr_released();  // drain any stale release edge
+        Serial.println("PWR long-press: hold to ~3s then release to pair");
+        return;
+    }
+    if (pair_state == PAIR_IDLE) return;
+
+    if (power_hal_pwr_released()) {
+        if (pair_state == PAIR_ARMED) {
+            Serial.println("Pair: released in window — clearing bonds, advertising");
+            ble_clear_bonds();
+        } else {
+            Serial.println("Pair: released too early — cancelled");
+        }
+        pair_state = PAIR_IDLE;
+        return;
+    }
+
+    uint32_t held = millis() - pair_long_seen_ms;
+    if (pair_state == PAIR_PENDING && held >= PAIR_ARM_AFTER_LONG_MS) {
+        pair_state = PAIR_ARMED;
+        Serial.println("Pair: armed — release to pair");
+    } else if (pair_state == PAIR_ARMED && held >= PAIR_DISARM_AFTER_LONG_MS) {
+        pair_state = PAIR_IDLE;  // power-off territory; don't pair
+        Serial.println("Pair: disarmed (holding toward power-off)");
+    }
+}
+
 void loop() {
     idle_tick();
     lv_timer_handler();
@@ -316,6 +376,7 @@ void loop() {
     ble_tick();
     power_hal_tick();
     imu_hal_tick();
+    sound_hal_tick();
     splash_tick();
     // Rotation transition (blank + ramp) would fight the idle fade — skip
     // ticks while the panel is dark. A rotation that happens during sleep
@@ -325,7 +386,8 @@ void loop() {
     // ---- Physical buttons ----
     //   PRIMARY   → HID Space  (Claude Code voice-mode PTT)
     //   SECONDARY → HID Shift+Tab  (mode toggle; only if the board has one)
-    //   PWR       → cycle screens; on splash, cycle animations
+    //   PWR       → on splash: cycle animations; on usage: cycle brightness;
+    //               hold ~3s + release: pairing mode
     // First press from sleep is consumed as a wake-only event by
     // idle_consume_wake_press(); the normal action fires from the second
     // press. Activity bookkeeping happens inside idle_consume_wake_press
@@ -333,16 +395,31 @@ void loop() {
     {
         static bool primary_was = false;
         static bool primary_wake_swallowed = false;
+        static uint32_t primary_press_ms = 0;
+        static bool primary_long_handled = false;
+        #define PRIMARY_LONG_MS 1500
+
         bool primary_now = input_hal_is_held(INPUT_BTN_PRIMARY);
         if (primary_now != primary_was) {
             if (primary_now) {
+                primary_press_ms = millis();
+                primary_long_handled = false;
                 if (idle_consume_wake_press()) primary_wake_swallowed = true;
                 else                            ble_keyboard_press(0x2C, 0);  // HID Space, no mods
             } else {
                 if (primary_wake_swallowed) primary_wake_swallowed = false;
                 else                        ble_keyboard_release();
+                primary_press_ms = 0;
             }
             primary_was = primary_now;
+        }
+        // Long-press detection while held
+        if (primary_now && !primary_long_handled && primary_press_ms > 0 &&
+            !primary_wake_swallowed &&
+            (millis() - primary_press_ms) >= PRIMARY_LONG_MS) {
+            primary_long_handled = true;
+            ble_keyboard_release();  // cancel HID key
+            ui_toggle_auto_rotate();
         }
 
         if (board_caps().button_count >= 2) {
@@ -363,10 +440,13 @@ void loop() {
 
         if (power_hal_pwr_pressed()) {
             if (!idle_consume_wake_press()) {
+                // On splash: cycle animations. On other screens: cycle screens.
                 if (ui_get_current_screen() == SCREEN_SPLASH) splash_next();
                 else                                          ui_cycle_screen();
             }
         }
+
+        pair_tick();
     }
 
     ble_state_t bs = ble_get_state();
@@ -391,8 +471,15 @@ void loop() {
         if (parse_json(ble_get_data(), &usage)) {
             const ProviderUsageData* sample = primary_usage(&usage);
             int g_before = usage_rate_group();
-            usage_rate_sample(sample->session_pct);
+bool session_reset = usage_rate_sample(sample->session_pct);
             int g_after = usage_rate_group();
+            // 5-hour session limit refilled → chime so the user knows they can
+            // use Claude again (no-op on boards without a buzzer). Gated on the
+            // daemon's opt-in `chime` config; the `buzz` serial cmd ignores it.
+            if (session_reset && sample->chime) {
+                Serial.println("session reset detected — chime");
+                sound_hal_play_reset();
+            }
             if (g_after != g_before) {
                 Serial.printf("usage rate: group %d -> %d (s=%.2f%%)\n",
                     g_before, g_after, sample->session_pct);
